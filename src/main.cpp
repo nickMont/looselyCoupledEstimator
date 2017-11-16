@@ -63,9 +63,9 @@ gnssimu::gnssimu()
 	imustate.resize(15); imustate.setZero();  //imu state with deltax/detlav/deltaeuler
 	Gamma.resize(15,15);
 	Gamma=Eigen::MatrixXd::Identity(15,15);
-	xState.resize(15); //true state
+	x_reported.resize(15); //true state
 	evxState.resize(9); //pos/vel/euler
-	
+
 	Fimu.resize(15,15);
 
 	initImu=false;
@@ -77,20 +77,39 @@ void gnssimu::processGPS(Eigen::VectorXd measGPS)
 {
 	//ASSUMED MEASUREMENT FORM: tgps, x, v, quaternion
 	initGps=true;
-	tlastgps=measGPS(0);
+	
 	if(initImu)
-	{gpsImuCallback(measGPS);}
-	else{gpsOnlyCallback(measGPS);}
+	{
+		tlastgps=measGPS(0); //update time FIRST to handle IMU time-matching
+		gpsImuCallback(measGPS);
+	}
+	else
+	{
+		gpsOnlyCallback(measGPS);
+		tlastgps=measGPS(0); //update time LAST to run KF for GPS
+	}
 }
 
 
 void gnssimu::processIMU(Eigen::VectorXd measIMU)
 {
-	initImu=true;
 	//ASSUMED MEASUREMENT FORM: timu, ax, aq
-	tlastimu=measIMU(0);
-	//complementary filter for IMU
-	
+
+	//if it has already been initialized. Must have gps before intializing
+	if(!initImu)
+	{
+		initImu=true;
+
+		Eigen::Vector3d tmpvec;
+		tmpvec<<measIMU(1),measIMU(2),measIMU(3); //NOTE: index 0 is time
+		rIMU=rGPS+lever_ab+tmpvec; //NOTE: assumes 0 attitude at intialization
+		tmpvec<<measIMU(4),measIMU(5),measIMU(6);
+		vIMU=vGPS+tmpvec;  //NOTE: assumes 0 attitude at initialization
+	}
+	else{
+		imuCallback(measIMU);  //complementary filter
+	}
+	tlastimu=measIMU(0);	
 }
 
 
@@ -114,17 +133,22 @@ void gnssimu::gpsImuCallback(Eigen::VectorXd zMeas)
 	vGPS<<zMeas(4),zMeas(5),zMeas(6);
 	ztilde=returnMeasurement();
 
-	kalmanPropagate(imustate, Pimu, Fimu, Qimu, Gamma, xkbar, Pimu);
+	Fimu=returnFimu(tlastgps-tlastimu);
+
+	//dummy output matrix
+	Eigen::MatrixXd PimuDum;
+	PimuDum.resize(Pimu.rows(),Pimu.cols());
+
+	kalmanPropagate(imustate, Pimu, Fimu, Qimu, Gamma, xkbar, PimuDum);
 	Eigen::MatrixXd H;
 	H.resize(6,15);
-	H=returnH();
-	kalmanMeasure(xkbar, Pimu, ztilde, H, Rgps, xkout, Pimu);
-	//LOOK UP HOW GROVES DOES RECOMBINATION
+	H=returnHcoupled();
+	kalmanMeasure(xkbar, PimuDum, ztilde, H, Rgps, xkout, Pimu);
 	for(int i=0; i++; i<=8){
-		xState(i)=evxState(i)+imustate(i);
+		x_reported(i)=evxState(i)+imustate(i);
 		imustate(i)=0; //deltaxve=0
 		//SET XVESTATE TO TRUTH SOMEWHERE
-		evxState(i)=xState(i);
+		evxState(i)=x_reported(i);
 	}
 	b_a<<imustate(9),imustate(10),imustate(11);
 	b_g<<imustate(12), imustate(13), imustate(14);
@@ -132,18 +156,39 @@ void gnssimu::gpsImuCallback(Eigen::VectorXd zMeas)
 
 }
 
-/*void gnssimu::imuCallback(Eigen::Vector zMeas)
+void gnssimu::imuCallback(Eigen::VectorXd zMeas)
 {
+	Eigen::Matrix3d C_temp;
+	Eigen::Vector3d omegaMeas, fMeas, fRot;
+	double dttemp;
 
-	rIMU=;
-	vIMU=;	
+	dttemp=zMeas(0)-tlastimu;
+	C_temp=C_hat;
+	fMeas<<zMeas(1),zMeas(2),zMeas(3); fMeas=fMeas-b_a;
+	omegaMeas<<zMeas(4),zMeas(5),zMeas(6); omegaMeas=omegaMeas-b_g;
+
+	//5.27
+	C_hat=C_temp*(Eigen::MatrixXd::Identity(3,3)+hatmat(omegaMeas)*dttemp)-Omega_mat*C_temp*dttemp;
+
+	//5.38
+	rIMU=rIMU+vIMU*dttemp+(fRot - 9.81*unit3(rIMU)-2*Omega_mat*vIMU)*dttemp*dttemp/2;
+
+	//assuming 5.28 form instead of 5.28 form
+	fRot=0.5*(C_temp+C_hat)*fMeas;
+	vIMU=vIMU + (fRot - 9.81*unit3(rIMU)-2*Omega_mat*vIMU)*dttemp;
+
+	//OMEGAMEAS=EULER(C_HAT), REUSING VARIABLE NAME TO SAVE MEMORY
+	omegaMeas=CTM_to_euler(C_hat);
+	for(int i=0; i++; i<=2){x_reported(i)=omegaMeas(i);}
+	for(int i=3; i++; i<=5){x_reported(i)=vIMU(i);}
+	for(int i=6; i++; i<=8){x_reported(i)=rIMU(i);}
 }
-*/
+
 
 //required functions
 Eigen::Matrix3d gnssimu::euler_to_CTM(Eigen::Vector3d eul)
 {
-	Eigen::Matrix3d C;
+	Eigen::Matrix3d CC;
 	double sin_phi, sin_theta, sin_psi, cos_phi, cos_theta, cos_psi;
 	sin_phi = sin(eul(0));
 	cos_phi = cos(eul(0));
@@ -152,16 +197,26 @@ Eigen::Matrix3d gnssimu::euler_to_CTM(Eigen::Vector3d eul)
 	sin_psi = sin(eul(2));
 	cos_psi = cos(eul(2));
 
-	C(0,0) = cos_theta * cos_psi;
-	C(0,1) = cos_theta * sin_psi;
-	C(0,2) = -sin_theta;
-	C(1,0) = -cos_phi * sin_psi + sin_phi * sin_theta * cos_psi;
-	C(1,1) = cos_phi * cos_psi + sin_phi * sin_theta * sin_psi;
-	C(1,2) = sin_phi * cos_theta;
-	C(2,0) = sin_phi * sin_psi + cos_phi * sin_theta * cos_psi;
-	C(2,1) = -sin_phi * cos_psi + cos_phi * sin_theta * sin_psi;
-	C(2,2) = cos_phi * cos_theta;
-	return C;
+	CC(0,0) = cos_theta * cos_psi;
+	CC(0,1) = cos_theta * sin_psi;
+	CC(0,2) = -sin_theta;
+	CC(1,0) = -cos_phi * sin_psi + sin_phi * sin_theta * cos_psi;
+	CC(1,1) = cos_phi * cos_psi + sin_phi * sin_theta * sin_psi;
+	CC(1,2) = sin_phi * cos_theta;
+	CC(2,0) = sin_phi * sin_psi + cos_phi * sin_theta * cos_psi;
+	CC(2,1) = -sin_phi * cos_psi + cos_phi * sin_theta * sin_psi;
+	CC(2,2) = cos_phi * cos_theta;
+	return CC;
+}
+
+
+Eigen::Vector3d gnssimu::CTM_to_euler(Eigen::Matrix3d CC)
+{
+	Eigen::Vector3d eeuler;
+	eeuler(0)=atan2(CC(1,2),CC(2,2));
+	eeuler(1)=-asin(CC(0,2));
+	eeuler(2)=atan2(CC(0,1),CC(0,0));
+	return eeuler;
 }
 
 
@@ -192,7 +247,7 @@ void gnssimu::updateState(Eigen::VectorXd instate)
 
 //returns H (see Groves 14.112)
 //C_hat is best current estimate of attitude.  May be propagated from previous state (see Groves 14.100+09olk,m)
-Eigen::MatrixXd gnssimu::returnH()
+Eigen::MatrixXd gnssimu::returnHcoupled()
 {
 	Eigen::Matrix<double, 6, 15> H;
 	Eigen::Matrix3d Hr1,Hv1,Hv5;
@@ -212,6 +267,25 @@ Eigen::MatrixXd gnssimu::returnH()
 		Hv1(2,0),Hv1(2,1),Hv1(2,2), 0,0,-1, 0,0,0, 0,0,0, Hv5(2,0),Hv5(2,1),Hv5(2,2);
 	return H;
 }
+
+
+Eigen::MatrixXd gnssimu::returnFimu(double dt)
+{
+	Eigen::MatrixXd FFimu;
+	FFimu.resize(15,15);
+	Eigen::Matrix3d zero3, ident3, F21, F23;
+	zero3.setZero();
+	//SET F21 F23
+	ident3.setZero(); ident3(0,0)=1; ident3(1,1)=1; ident3(2,2)=1; //Eigen::Matrix3d::Identity threw an error
+	FFimu << ident3-Omega_mat*dt, zero3, zero3, zero3, C_hat*dt,
+		F21*dt, ident3-2*Omega_mat*dt, F23*dt, C_hat*dt, zero3,
+		zero3, ident3*dt, ident3, zero3, zero3,
+		zero3, zero3, zero3, ident3, zero3,
+		zero3, zero3, zero3, zero3, ident3;
+
+	return FFimu;
+}
+
 
 
 //initstates is 15x1: euler(0), x(0), v(0), b_a(0), b_g(0)
@@ -297,6 +371,11 @@ void gnssimu::kalmanMeasure(Eigen::VectorXd &xkbar, Eigen::MatrixXd &Pkbar, Eige
 		+K*R*K.transpose();  //Joseph form, see 3.58
 }
 
+
+Eigen::Vector3d gnssimu::unit3(Eigen::Vector3d &x_in)
+{
+	return x_in/x_in.norm();
+}
 
 
 //filter
